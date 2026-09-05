@@ -404,21 +404,34 @@ func (bc *Bitcask) Close() error {
 	return nil
 }
 
-// Merge reclaims disk space by compacting immutable log files, discarding dead/deleted records.
+// Merge reclaims disk space by compacting immutable log files in the background without blocking client writes.
 func (bc *Bitcask) Merge() error {
+	// 1. Brief lock to snapshot files to compact and rotate active file
 	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
 	if len(bc.immutableFiles) == 0 {
+		bc.mu.Unlock()
 		return nil // No immutable files to compact
 	}
 
-	// 1. Rotate current active file so all uncompacted records become immutable
 	if err := bc.rotateActiveFile(); err != nil {
+		bc.mu.Unlock()
 		return fmt.Errorf("failed to rotate active file for merge: %w", err)
 	}
 
-	// 2. Setup temporary merge directory
+	maxMergeFileID := bc.fileID - 1
+
+	var fileIDs []uint32
+	for id := range bc.immutableFiles {
+		if id <= maxMergeFileID {
+			fileIDs = append(fileIDs, id)
+		}
+	}
+	sort.Slice(fileIDs, func(i, j int) bool {
+		return fileIDs[i] < fileIDs[j]
+	})
+	bc.mu.Unlock() // UNLOCK! Client Put/Get calls can run freely during compaction!
+
+	// 2. Setup sandbox merge directory
 	mergeDir := filepath.Join(bc.opts.DirPath, ".merge_temp")
 	_ = os.RemoveAll(mergeDir)
 	if err := os.MkdirAll(mergeDir, 0755); err != nil {
@@ -435,25 +448,22 @@ func (bc *Bitcask) Merge() error {
 		return fmt.Errorf("failed to open merge db instance: %w", err)
 	}
 
-	// 4. Collect and sort all immutable file IDs
-	var fileIDs []uint32
-	for id := range bc.immutableFiles {
-		fileIDs = append(fileIDs, id)
-	}
-	sort.Slice(fileIDs, func(i, j int) bool {
-		return fileIDs[i] < fileIDs[j]
-	})
+	compactedKeydir := make(map[string]IndexEntry)
 
-	// 5. Scan immutable files and copy only live, non-deleted records
+	// 4. Copy live records in background and build compactedKeydir on the fly (No disk re-scan!)
 	for _, id := range fileIDs {
-		file := bc.immutableFiles[id]
-		var offset uint64 = 0
+		fileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", id))
+		file, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+		if err != nil {
+			continue
+		}
 
+		var offset uint64 = 0
 		for {
 			headerBuf := make([]byte, HeaderSize)
 			n, err := file.ReadAt(headerBuf, int64(offset))
 			if n < HeaderSize || err == io.EOF {
-				break // End of file or incomplete record
+				break
 			}
 
 			header, err := DecodeHeader(headerBuf)
@@ -474,40 +484,50 @@ func (bc *Bitcask) Merge() error {
 				break
 			}
 
-			// Check if this record is still the live version in Keydir
 			key := string(payloadBuf[:header.KeySize])
+
+			// Check if this record is still the live version in main Keydir
+			bc.mu.RLock()
 			entry, ok := bc.keydir.Get(key)
+			bc.mu.RUnlock()
 
 			if ok && entry.FileID == id && entry.RecordPos == offset && !header.IsTombstone() {
 				value := payloadBuf[header.KeySize:]
 				if err := mergeDB.Put([]byte(key), value); err != nil {
+					file.Close()
 					mergeDB.Close()
 					return fmt.Errorf("failed to write live record to merge DB: %w", err)
 				}
+
+				// Track new location metadata in memory (On-The-Fly Index)
+				mergeDB.mu.RLock()
+				newEntry, _ := mergeDB.keydir.Get(key)
+				mergeDB.mu.RUnlock()
+				compactedKeydir[key] = newEntry
 			}
 
 			offset += HeaderSize + uint64(payloadLen)
 		}
+		file.Close()
 	}
 
 	_ = mergeDB.Close()
 
-	// 6. Close and remove old immutable files
-	for id, file := range bc.immutableFiles {
-		_ = file.Close()
+	// 5. Atomic Microsecond Swap & Conflict Resolution under Lock
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	// Close & remove old compacted immutable files
+	for _, id := range fileIDs {
+		if f, exists := bc.immutableFiles[id]; exists {
+			_ = f.Close()
+			delete(bc.immutableFiles, id)
+		}
 		fileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", id))
 		_ = os.Remove(fileName)
-		delete(bc.immutableFiles, id)
 	}
 
-	if bc.activeFile != nil {
-		_ = bc.activeFile.Close()
-		activeFileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", bc.fileID))
-		_ = os.Remove(activeFileName)
-		bc.activeFile = nil
-	}
-
-	// 7. Move compacted files from mergeDir into primary db directory
+	// Move new merged files into main directory and add descriptors
 	mergeEntries, err := os.ReadDir(mergeDir)
 	if err != nil {
 		return fmt.Errorf("failed to read merge temp directory: %w", err)
@@ -520,20 +540,29 @@ func (bc *Bitcask) Merge() error {
 			if err := os.Rename(oldPath, newPath); err != nil {
 				return fmt.Errorf("failed to move merged file %s: %w", entry.Name(), err)
 			}
+
+			// Open descriptor for new merged file
+			nameWithoutExt := strings.TrimSuffix(entry.Name(), ".data")
+			id, _ := strconv.ParseUint(nameWithoutExt, 10, 32)
+			f, err := os.OpenFile(newPath, os.O_RDONLY, 0644)
+			if err == nil {
+				bc.immutableFiles[uint32(id)] = f
+			}
 		}
 	}
 
-	// 8. Re-open data files and reload index
-	bc.keydir = NewKeydir()
-	if err := bc.loadDataFiles(); err != nil {
-		return fmt.Errorf("failed to reload data files after merge: %w", err)
-	}
-
-	if err := bc.replayLogs(); err != nil {
-		return fmt.Errorf("failed to replay logs after merge: %w", err)
+	// Update Keydir with Conflict Resolution:
+	// If a client updated a key in activeFile (FileID > maxMergeFileID) while merge ran, KEEP ACTIVE WRITE!
+	for key, newEntry := range compactedKeydir {
+		currentEntry, ok := bc.keydir.Get(key)
+		if ok && currentEntry.FileID > maxMergeFileID {
+			continue // Keep newer active client write!
+		}
+		bc.keydir.Put(key, newEntry)
 	}
 
 	return nil
 }
+
 
 
