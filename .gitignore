@@ -1,0 +1,10 @@
+# Test and demo data directories
+test_data*
+data_demo/
+*.data
+*.hint
+
+# Binaries & OS files
+*.o
+*.so
+.DS_Store
