@@ -2,10 +2,13 @@ package bitcask
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
 
 func TestPhase1_PutAndGet(t *testing.T) {
 	testDir := "./test_data_put_get"
@@ -425,6 +428,101 @@ func TestPhase4_InspectDiskData(t *testing.T) {
 		t.Errorf("expected deleted user:200 to return ErrKeyNotFound, got %v", err)
 	}
 }
+
+func TestPhase6_Merge(t *testing.T) {
+	testDir := "./test_data_merge"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	opts := Options{
+		DirPath:     testDir,
+		MaxFileSize: 120, // Rotate every ~120 bytes
+	}
+
+	db, err := OpenWithOptions(opts)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// 1. Write 30 keys
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("user:%d", i)
+		val := fmt.Sprintf("initial_payload_value_padding_bytes_%d", i)
+		if err := db.Put([]byte(key), []byte(val)); err != nil {
+			t.Fatalf("put failed: %v", err)
+		}
+	}
+
+	// 2. Overwrite all 30 keys 4 times (creates 120 stale records on disk)
+	for round := 1; round <= 4; round++ {
+		for i := 0; i < 30; i++ {
+			key := fmt.Sprintf("user:%d", i)
+			val := fmt.Sprintf("updated_round_%d_payload_value_%d", round, i)
+			if err := db.Put([]byte(key), []byte(val)); err != nil {
+				t.Fatalf("overwrite failed: %v", err)
+			}
+		}
+	}
+
+	// 3. Delete 10 keys (creates 10 Tombstone records on disk)
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("user:%d", i)
+		if err := db.Delete([]byte(key)); err != nil {
+			t.Fatalf("delete failed: %v", err)
+		}
+	}
+
+	// Helper to calculate total size of all .data files in testDir
+	getDirSize := func() int64 {
+		var total int64
+		entries, _ := os.ReadDir(testDir)
+		for _, entry := range entries {
+			if strings.HasSuffix(entry.Name(), ".data") {
+				info, _ := entry.Info()
+				total += info.Size()
+			}
+		}
+		return total
+	}
+
+	sizeBeforeMerge := getDirSize()
+
+	// 4. Trigger Merge (Compaction & Garbage Collection)
+	if err := db.Merge(); err != nil {
+		t.Fatalf("Merge failed: %v", err)
+	}
+
+	sizeAfterMerge := getDirSize()
+
+	// 5. Assert disk size shrank significantly (at least 40% space reclamation)
+	if sizeAfterMerge >= sizeBeforeMerge {
+		t.Errorf("expected sizeAfterMerge (%d) < sizeBeforeMerge (%d)", sizeAfterMerge, sizeBeforeMerge)
+	}
+
+	// 6. Verify all 20 surviving live keys are readable and contain latest round values
+	for i := 10; i < 30; i++ {
+		key := fmt.Sprintf("user:%d", i)
+		expectedVal := fmt.Sprintf("updated_round_4_payload_value_%d", i)
+		val, err := db.Get([]byte(key))
+		if err != nil {
+			t.Fatalf("failed to get key %s after merge: %v", key, err)
+		}
+		if string(val) != expectedVal {
+			t.Errorf("for key %s: expected '%s', got '%s'", key, expectedVal, string(val))
+		}
+	}
+
+	// 7. Verify all 10 deleted keys return ErrKeyNotFound after merge
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("user:%d", i)
+		_, err := db.Get([]byte(key))
+		if err != ErrKeyNotFound {
+			t.Errorf("expected deleted key %s to return ErrKeyNotFound after merge, got %v", key, err)
+		}
+	}
+}
+
 
 
 

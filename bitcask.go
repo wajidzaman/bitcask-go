@@ -392,13 +392,148 @@ func (bc *Bitcask) Close() error {
 	if bc.activeFile != nil {
 		_ = bc.activeFile.Sync()
 		_ = bc.activeFile.Close()
+		bc.activeFile = nil
 	}
 
-	for _, file := range bc.immutableFiles {
+	for id, file := range bc.immutableFiles {
 		_ = file.Sync()
 		_ = file.Close()
+		delete(bc.immutableFiles, id)
 	}
 
 	return nil
 }
+
+// Merge reclaims disk space by compacting immutable log files, discarding dead/deleted records.
+func (bc *Bitcask) Merge() error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if len(bc.immutableFiles) == 0 {
+		return nil // No immutable files to compact
+	}
+
+	// 1. Rotate current active file so all uncompacted records become immutable
+	if err := bc.rotateActiveFile(); err != nil {
+		return fmt.Errorf("failed to rotate active file for merge: %w", err)
+	}
+
+	// 2. Setup temporary merge directory
+	mergeDir := filepath.Join(bc.opts.DirPath, ".merge_temp")
+	_ = os.RemoveAll(mergeDir)
+	if err := os.MkdirAll(mergeDir, 0755); err != nil {
+		return fmt.Errorf("failed to create merge temp dir: %w", err)
+	}
+	defer os.RemoveAll(mergeDir)
+
+	// 3. Open temporary Bitcask instance inside mergeDir
+	mergeDB, err := OpenWithOptions(Options{
+		DirPath:     mergeDir,
+		MaxFileSize: bc.opts.MaxFileSize,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to open merge db instance: %w", err)
+	}
+
+	// 4. Collect and sort all immutable file IDs
+	var fileIDs []uint32
+	for id := range bc.immutableFiles {
+		fileIDs = append(fileIDs, id)
+	}
+	sort.Slice(fileIDs, func(i, j int) bool {
+		return fileIDs[i] < fileIDs[j]
+	})
+
+	// 5. Scan immutable files and copy only live, non-deleted records
+	for _, id := range fileIDs {
+		file := bc.immutableFiles[id]
+		var offset uint64 = 0
+
+		for {
+			headerBuf := make([]byte, HeaderSize)
+			n, err := file.ReadAt(headerBuf, int64(offset))
+			if n < HeaderSize || err == io.EOF {
+				break // End of file or incomplete record
+			}
+
+			header, err := DecodeHeader(headerBuf)
+			if err != nil {
+				break
+			}
+
+			var valSize uint32 = 0
+			if !header.IsTombstone() {
+				valSize = header.ValueSize
+			}
+
+			payloadLen := header.KeySize + valSize
+			payloadBuf := make([]byte, payloadLen)
+
+			pn, err := file.ReadAt(payloadBuf, int64(offset+HeaderSize))
+			if uint32(pn) < payloadLen {
+				break
+			}
+
+			// Check if this record is still the live version in Keydir
+			key := string(payloadBuf[:header.KeySize])
+			entry, ok := bc.keydir.Get(key)
+
+			if ok && entry.FileID == id && entry.RecordPos == offset && !header.IsTombstone() {
+				value := payloadBuf[header.KeySize:]
+				if err := mergeDB.Put([]byte(key), value); err != nil {
+					mergeDB.Close()
+					return fmt.Errorf("failed to write live record to merge DB: %w", err)
+				}
+			}
+
+			offset += HeaderSize + uint64(payloadLen)
+		}
+	}
+
+	_ = mergeDB.Close()
+
+	// 6. Close and remove old immutable files
+	for id, file := range bc.immutableFiles {
+		_ = file.Close()
+		fileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", id))
+		_ = os.Remove(fileName)
+		delete(bc.immutableFiles, id)
+	}
+
+	if bc.activeFile != nil {
+		_ = bc.activeFile.Close()
+		activeFileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", bc.fileID))
+		_ = os.Remove(activeFileName)
+		bc.activeFile = nil
+	}
+
+	// 7. Move compacted files from mergeDir into primary db directory
+	mergeEntries, err := os.ReadDir(mergeDir)
+	if err != nil {
+		return fmt.Errorf("failed to read merge temp directory: %w", err)
+	}
+
+	for _, entry := range mergeEntries {
+		if strings.HasSuffix(entry.Name(), ".data") {
+			oldPath := filepath.Join(mergeDir, entry.Name())
+			newPath := filepath.Join(bc.opts.DirPath, entry.Name())
+			if err := os.Rename(oldPath, newPath); err != nil {
+				return fmt.Errorf("failed to move merged file %s: %w", entry.Name(), err)
+			}
+		}
+	}
+
+	// 8. Re-open data files and reload index
+	bc.keydir = NewKeydir()
+	if err := bc.loadDataFiles(); err != nil {
+		return fmt.Errorf("failed to reload data files after merge: %w", err)
+	}
+
+	if err := bc.replayLogs(); err != nil {
+		return fmt.Errorf("failed to replay logs after merge: %w", err)
+	}
+
+	return nil
+}
+
 
