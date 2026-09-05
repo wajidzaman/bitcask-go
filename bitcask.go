@@ -3,10 +3,184 @@ package bitcask
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
+
+// replayLogs iterates over all .data files in chronological order, rebuilds the Keydir in RAM,
+// and truncates any torn write / corrupted payload at the active file tail.
+func (bc *Bitcask) replayLogs() error {
+	// Collect all file IDs in sorted order
+	var fileIDs []uint32
+	for id := range bc.immutableFiles {
+		fileIDs = append(fileIDs, id)
+	}
+	fileIDs = append(fileIDs, bc.fileID)
+
+	sort.Slice(fileIDs, func(i, j int) bool {
+		return fileIDs[i] < fileIDs[j]
+	})
+
+	for _, id := range fileIDs {
+		var file *os.File
+		if id == bc.fileID {
+			file = bc.activeFile
+		} else {
+			file = bc.immutableFiles[id]
+		}
+
+		var offset uint64 = 0
+		for {
+			headerBuf := make([]byte, HeaderSize)
+			n, err := file.ReadAt(headerBuf, int64(offset))
+			if n == 0 && (err == io.EOF || err != nil) {
+				break // Clean EOF reached
+			}
+
+			// Partial header read at EOF (Torn Write)
+			if n < HeaderSize {
+				if id == bc.fileID {
+					_ = bc.activeFile.Truncate(int64(offset))
+					break
+				}
+				return fmt.Errorf("truncated header in immutable file %d at offset %d", id, offset)
+			}
+
+			header, err := DecodeHeader(headerBuf)
+			if err != nil {
+				if id == bc.fileID {
+					_ = bc.activeFile.Truncate(int64(offset))
+					break
+				}
+				return fmt.Errorf("corrupt header in file %d at offset %d: %w", id, offset, err)
+			}
+
+			var valSize uint32 = 0
+			if !header.IsTombstone() {
+				valSize = header.ValueSize
+			}
+
+			payloadLen := header.KeySize + valSize
+			payloadBuf := make([]byte, payloadLen)
+
+			pn, err := file.ReadAt(payloadBuf, int64(offset+HeaderSize))
+			if uint32(pn) < payloadLen {
+				// Partial payload read at EOF (Torn Write)
+				if id == bc.fileID {
+					_ = bc.activeFile.Truncate(int64(offset))
+					break
+				}
+				return fmt.Errorf("truncated payload in immutable file %d at offset %d", id, offset)
+			}
+
+			// Verify CRC: checksum covers header fields (from timestamp) + payload
+			crcBuffer := make([]byte, 16+payloadLen)
+			copy(crcBuffer[:16], headerBuf[4:20])
+			copy(crcBuffer[16:], payloadBuf)
+
+			if !VerifyCRC(header.CRC, crcBuffer) {
+				if id == bc.fileID {
+					_ = bc.activeFile.Truncate(int64(offset))
+					break
+				}
+				return ErrCorruptedRecord
+			}
+
+
+			key := string(payloadBuf[:header.KeySize])
+
+			if header.IsTombstone() {
+				bc.keydir.Delete(key)
+			} else {
+				recordPos := offset
+				valuePos := offset + HeaderSize + uint64(header.KeySize)
+				bc.keydir.Put(key, IndexEntry{
+					FileID:    id,
+					ValueSize: header.ValueSize,
+					ValuePos:  valuePos,
+					RecordPos: recordPos,
+					Timestamp: header.Timestamp,
+				})
+			}
+
+			offset += HeaderSize + uint64(payloadLen)
+		}
+	}
+
+	// Update active file write pointer to reflect valid end of file
+	stat, err := bc.activeFile.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat active file after replay: %w", err)
+	}
+	bc.writePos = uint64(stat.Size())
+
+	return nil
+}
+
+
+
+// loadDataFiles scans the DB directory for all .data files, sorts them,
+// opens historical files as immutable descriptors, and sets the highest ID as active file.
+func (bc *Bitcask) loadDataFiles() error {
+	entries, err := os.ReadDir(bc.opts.DirPath)
+	if err != nil {
+		return fmt.Errorf("failed to read db directory: %w", err)
+	}
+
+	var fileIDs []uint32
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
+			continue
+		}
+
+		nameWithoutExt := strings.TrimSuffix(entry.Name(), ".data")
+		id, err := strconv.ParseUint(nameWithoutExt, 10, 32)
+		if err != nil {
+			continue // Skip non-matching filenames
+		}
+		fileIDs = append(fileIDs, uint32(id))
+	}
+
+	// If no data files exist, start with file ID 1
+	if len(fileIDs) == 0 {
+		fileIDs = append(fileIDs, 1)
+	}
+
+	// Sort file IDs in ascending order
+	sort.Slice(fileIDs, func(i, j int) bool {
+		return fileIDs[i] < fileIDs[j]
+	})
+
+	// Open immutable files (all except the last/highest ID)
+	for i := 0; i < len(fileIDs)-1; i++ {
+		id := fileIDs[i]
+		fileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", id))
+		file, err := os.OpenFile(fileName, os.O_RDONLY, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to open immutable file %s: %w", fileName, err)
+		}
+		bc.immutableFiles[id] = file
+	}
+
+	// Open the active file (highest ID) in read-write append mode
+	activeID := fileIDs[len(fileIDs)-1]
+	activeFileName := filepath.Join(bc.opts.DirPath, fmt.Sprintf("%05d.data", activeID))
+	activeFile, err := os.OpenFile(activeFileName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to open active file %s: %w", activeFileName, err)
+	}
+
+	bc.fileID = activeID
+	bc.activeFile = activeFile
+
+	return nil
+}
+
 
 var (
 	ErrKeyNotFound = errors.New("key not found")
@@ -29,37 +203,32 @@ func Open(dirPath string) (*Bitcask, error) {
 	return OpenWithOptions(DefaultOptions(dirPath))
 }
 
-// OpenWithOptions initializes a Bitcask database with custom options.
+// OpenWithOptions initializes a Bitcask database with custom options and recovers state from disk.
 func OpenWithOptions(opts Options) (*Bitcask, error) {
 	if err := os.MkdirAll(opts.DirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create db directory: %w", err)
 	}
 
-	fileID := uint32(1)
-	activeFileName := filepath.Join(opts.DirPath, fmt.Sprintf("%05d.data", fileID))
-
-	file, err := os.OpenFile(activeFileName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open active file: %w", err)
-	}
-
-	stat, err := file.Stat()
-	if err != nil {
-		file.Close()
-		return nil, fmt.Errorf("failed to stat active file: %w", err)
-	}
-
 	bc := &Bitcask{
 		opts:           opts,
-		activeFile:     file,
-		fileID:         fileID,
 		immutableFiles: make(map[uint32]*os.File),
 		keydir:         NewKeydir(),
-		writePos:       uint64(stat.Size()),
+	}
+
+	// 1. Discover existing .data files, set up immutable descriptors and active file
+	if err := bc.loadDataFiles(); err != nil {
+		return nil, fmt.Errorf("failed to load data files: %w", err)
+	}
+
+	// 2. Replay log records from disk to rebuild in-memory Keydir & truncate torn write tail
+	if err := bc.replayLogs(); err != nil {
+		_ = bc.Close()
+		return nil, fmt.Errorf("failed to replay logs: %w", err)
 	}
 
 	return bc, nil
 }
+
 
 // rotateActiveFile closes active file, adds it to immutableFiles map, and spawns new active file.
 // Must be called under bc.mu.Lock().

@@ -199,3 +199,232 @@ func TestPhase3_FileRotation(t *testing.T) {
 		t.Errorf("expected at least 2 rotated .data files, found %d", dataFilesCount)
 	}
 }
+
+func TestPhase4_LoadDataFiles(t *testing.T) {
+	testDir := "./test_data_load_files"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+
+
+	if err := os.MkdirAll(testDir, 0755); err != nil {
+		t.Fatalf("failed to create test dir: %v", err)
+	}
+
+	// Pre-create 3 dummy data files and 1 non-data file
+	dummyFiles := []string{"00001.data", "00002.data", "00003.data", "notes.txt"}
+	for _, f := range dummyFiles {
+		path := filepath.Join(testDir, f)
+		if err := os.WriteFile(path, []byte("dummy data"), 0644); err != nil {
+			t.Fatalf("failed to create dummy file %s: %v", f, err)
+		}
+	}
+
+	bc := &Bitcask{
+		opts: Options{
+			DirPath: testDir,
+		},
+		immutableFiles: make(map[uint32]*os.File),
+		keydir:         NewKeydir(),
+	}
+
+	// Execute loadDataFiles
+	if err := bc.loadDataFiles(); err != nil {
+		t.Fatalf("loadDataFiles failed: %v", err)
+	}
+	defer bc.Close()
+
+	// Verify active file ID is 3 (highest ID)
+	if bc.fileID != 3 {
+		t.Errorf("expected active fileID 3, got %d", bc.fileID)
+	}
+
+	// Verify immutable files contains file IDs 1 and 2
+	if len(bc.immutableFiles) != 2 {
+		t.Errorf("expected 2 immutable files, got %d", len(bc.immutableFiles))
+	}
+
+	if _, ok := bc.immutableFiles[1]; !ok {
+		t.Errorf("expected immutableFiles to contain file 1")
+	}
+
+	if _, ok := bc.immutableFiles[2]; !ok {
+		t.Errorf("expected immutableFiles to contain file 2")
+	}
+}
+
+func TestPhase4_RestartRecovery(t *testing.T) {
+	testDir := "./test_data_recovery"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	// 1. Open DB, put keys, delete one key, and close
+	db, err := Open(testDir)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	if err := db.Put([]byte("key:1"), []byte("val:1")); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	if err := db.Put([]byte("key:2"), []byte("val:2")); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	if err := db.Put([]byte("key:3"), []byte("val:3")); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+
+	// Delete key:2 via Tombstone
+	if err := db.Delete([]byte("key:2")); err != nil {
+		t.Fatalf("delete failed: %v", err)
+	}
+
+	// Overwrite key:1
+	if err := db.Put([]byte("key:1"), []byte("val:1_updated")); err != nil {
+		t.Fatalf("overwrite failed: %v", err)
+	}
+
+	db.Close() // RAM Keydir is completely wiped!
+
+	// 2. Reopen DB -> should replay log from disk and rebuild Keydir
+	reopenedDB, err := Open(testDir)
+	if err != nil {
+		t.Fatalf("failed to reopen db: %v", err)
+	}
+	defer reopenedDB.Close()
+
+	// 3. Verify key:1 has updated value
+	val1, err := reopenedDB.Get([]byte("key:1"))
+	if err != nil {
+		t.Fatalf("failed to get key:1 after restart: %v", err)
+	}
+	if string(val1) != "val:1_updated" {
+		t.Errorf("expected 'val:1_updated', got '%s'", string(val1))
+	}
+
+	// 4. Verify key:3 exists
+	val3, err := reopenedDB.Get([]byte("key:3"))
+	if err != nil {
+		t.Fatalf("failed to get key:3 after restart: %v", err)
+	}
+	if string(val3) != "val:3" {
+		t.Errorf("expected 'val:3', got '%s'", string(val3))
+	}
+
+	// 5. Verify deleted key:2 returns ErrKeyNotFound
+	_, err = reopenedDB.Get([]byte("key:2"))
+	if err != ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound for key:2, got %v", err)
+	}
+}
+
+func TestPhase4_TornWriteTruncation(t *testing.T) {
+	testDir := "./test_data_torn_write"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	// 1. Write valid records and close
+	db, err := Open(testDir)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	if err := db.Put([]byte("good:key"), []byte("good:value")); err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	db.Close()
+
+	// Measure valid file size
+	dataPath := filepath.Join(testDir, "00001.data")
+	statBefore, err := os.Stat(dataPath)
+	if err != nil {
+		t.Fatalf("failed to stat data file: %v", err)
+	}
+	validSize := statBefore.Size()
+
+	// 2. Simulate torn write / crash by appending 12 corrupted garbage bytes to active file
+	f, err := os.OpenFile(dataPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("failed to open file for corrupt append: %v", err)
+	}
+	_, _ = f.Write([]byte("GARBAGE_BYTES"))
+	f.Close()
+
+	statCorrupt, _ := os.Stat(dataPath)
+	if statCorrupt.Size() <= validSize {
+		t.Fatalf("expected file size to grow after corruption append")
+	}
+
+	// 3. Reopen DB -> should detect corrupt tail and truncate file back to validSize
+	reopenedDB, err := Open(testDir)
+	if err != nil {
+		t.Fatalf("failed to reopen db: %v", err)
+	}
+	defer reopenedDB.Close()
+
+	// 4. Verify valid record is still intact
+	val, err := reopenedDB.Get([]byte("good:key"))
+	if err != nil {
+		t.Fatalf("failed to get good:key after recovery: %v", err)
+	}
+	if string(val) != "good:value" {
+		t.Errorf("expected 'good:value', got '%s'", string(val))
+	}
+
+	// 5. Verify file was truncated back to validSize
+	statAfter, _ := os.Stat(dataPath)
+	if statAfter.Size() != validSize {
+		t.Errorf("expected file size truncated to %d, got %d", validSize, statAfter.Size())
+	}
+}
+
+func TestPhase4_InspectDiskData(t *testing.T) {
+	testDir := "./test_data_inspect"
+	os.RemoveAll(testDir)
+	// We intentionally do NOT defer os.RemoveAll(testDir) so you can inspect the binary files!
+
+	opts := Options{
+		DirPath:     testDir,
+		MaxFileSize: 100, // Trigger rotation after ~100 bytes
+	}
+
+	db, err := OpenWithOptions(opts)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+
+	// Write real Bitcask binary records (Header + Key + Value)
+	_ = db.Put([]byte("user:100"), []byte("alice_johnson_payload_data_12345"))
+	_ = db.Put([]byte("user:200"), []byte("bob_smith_payload_data_12345"))
+	_ = db.Put([]byte("user:300"), []byte("charlie_brown_payload_data_12345"))
+	_ = db.Delete([]byte("user:200"))                                      // Writes real Tombstone marker
+	_ = db.Put([]byte("user:100"), []byte("alice_updated_val_payload_9999")) // Overwrite
+
+	db.Close()
+
+	// Reopen DB to verify full recovery from real disk records
+	reopenedDB, err := OpenWithOptions(opts)
+	if err != nil {
+		t.Fatalf("failed to reopen db: %v", err)
+	}
+	defer reopenedDB.Close()
+
+	// Verify recovered values
+	val1, err := reopenedDB.Get([]byte("user:100"))
+	if err != nil || string(val1) != "alice_updated_val_payload_9999" {
+		t.Errorf("failed to recover updated user:100, got %s, err: %v", string(val1), err)
+	}
+
+	val3, err := reopenedDB.Get([]byte("user:300"))
+	if err != nil || string(val3) != "charlie_brown_payload_data_12345" {
+		t.Errorf("failed to recover user:300, got %s, err: %v", string(val3), err)
+	}
+
+	_, err = reopenedDB.Get([]byte("user:200"))
+	if err != ErrKeyNotFound {
+		t.Errorf("expected deleted user:200 to return ErrKeyNotFound, got %v", err)
+	}
+}
+
+
+
