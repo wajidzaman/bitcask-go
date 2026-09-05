@@ -13,19 +13,32 @@ func main() {
 	dbDir := "./data_demo"
 	defer os.RemoveAll(dbDir)
 
-	fmt.Println("=== Bitcask Learning - Phase 1 Demo ===")
-	fmt.Printf("1. Opening Bitcask DB in '%s'...\n", dbDir)
+	fmt.Println("=== Bitcask Learning - Phase 3 Demo (Multi-File Rotation) ===")
 
-	db, err := bitcask.Open(dbDir)
+	// 1. Configure custom options with small MaxFileSize threshold (120 Bytes)
+	opts := bitcask.Options{
+		DirPath:     dbDir,
+		MaxFileSize: 120,
+	}
+
+	fmt.Printf("1. Opening Bitcask DB in '%s' (MaxFileSize = %d bytes)...\n", dbDir, opts.MaxFileSize)
+
+	db, err := bitcask.OpenWithOptions(opts)
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
 
-	// 2. Insert records
-	keys := []string{"name", "framework", "version"}
-	vals := []string{"Bitcask Engine", "Go 1.27", "v0.1.0"}
+	// 2. Insert multiple records to trigger file rotation
+	keys := []string{"user:1", "user:2", "user:3", "user:4", "user:5"}
+	vals := []string{
+		"alice_padding_data_123456789",
+		"bob_padding_data_123456789",
+		"charlie_padding_data_123456789",
+		"david_padding_data_123456789",
+		"eve_padding_data_123456789",
+	}
 
-	fmt.Println("\n2. Writing Records (Append-Only Log):")
+	fmt.Println("\n2. Writing Records (Log Rotation Active):")
 	for i := range keys {
 		err := db.Put([]byte(keys[i]), []byte(vals[i]))
 		if err != nil {
@@ -34,8 +47,8 @@ func main() {
 		fmt.Printf("   -> Put('%s' => '%s')\n", keys[i], vals[i])
 	}
 
-	// 3. Read records back
-	fmt.Println("\n3. Reading Records via In-Memory Keydir Index ($O(1)$ Single Seek):")
+	// 3. Read records back across historical rotated files
+	fmt.Println("\n3. Reading Records via Keydir ($O(1)$ Single Seek across files):")
 	for _, key := range keys {
 		val, err := db.Get([]byte(key))
 		if err != nil {
@@ -44,13 +57,18 @@ func main() {
 		fmt.Printf("   <- Get('%s') => '%s'\n", key, string(val))
 	}
 
-	// 4. Inspect raw file on disk
-	dataFile := filepath.Join(dbDir, "00001.data")
-	info, err := os.Stat(dataFile)
+	// 4. List rotated disk files
+	fmt.Println("\n4. Inspected On-Disk Rotated Files:")
+	entries, err := os.ReadDir(dbDir)
 	if err == nil {
-		fmt.Printf("\n4. Disk File Status: '%s' size = %d bytes\n", dataFile, info.Size())
+		for _, entry := range entries {
+			if filepath.Ext(entry.Name()) == ".data" {
+				info, _ := entry.Info()
+				fmt.Printf("   📁 Data File: '%s' | Size: %d bytes\n", entry.Name(), info.Size())
+			}
+		}
 	}
 
 	db.Close()
-	fmt.Println("\n=== Phase 1 Execution Finished Successfully! ===")
+	fmt.Println("\n=== Phase 3 Demo Finished Successfully! ===")
 }

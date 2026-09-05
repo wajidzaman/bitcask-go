@@ -139,3 +139,63 @@ func TestPhase2_OverwriteAndDelete(t *testing.T) {
 	}
 }
 
+func TestPhase3_FileRotation(t *testing.T) {
+	testDir := "./test_data_phase3"
+	os.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
+
+	// Set a tiny MaxFileSize threshold (100 Bytes) to trigger rotation frequently
+	opts := Options{
+		DirPath:     testDir,
+		MaxFileSize: 100,
+	}
+
+	db, err := OpenWithOptions(opts)
+	if err != nil {
+		t.Fatalf("failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	// Write 5 records, each record ~35 bytes -> should spawn at least 2-3 data files
+	pairs := map[string]string{
+		"key:1": "value_one_padding_bytes_12345",
+		"key:2": "value_two_padding_bytes_12345",
+		"key:3": "value_three_padding_bytes_12345",
+		"key:4": "value_four_padding_bytes_12345",
+		"key:5": "value_five_padding_bytes_12345",
+	}
+
+	for k, v := range pairs {
+		if err := db.Put([]byte(k), []byte(v)); err != nil {
+			t.Fatalf("failed to put key %s: %v", k, err)
+		}
+	}
+
+	// Verify all keys can be read cleanly across historical files
+	for k, expectedVal := range pairs {
+		val, err := db.Get([]byte(k))
+		if err != nil {
+			t.Fatalf("failed to get key %s: %v", k, err)
+		}
+		if string(val) != expectedVal {
+			t.Errorf("for key %s: expected %s, got %s", k, expectedVal, string(val))
+		}
+	}
+
+	// Verify that multiple .data files were actually created in directory
+	files, err := os.ReadDir(testDir)
+	if err != nil {
+		t.Fatalf("failed to read test dir: %v", err)
+	}
+
+	dataFilesCount := 0
+	for _, f := range files {
+		if filepath.Ext(f.Name()) == ".data" {
+			dataFilesCount++
+		}
+	}
+
+	if dataFilesCount < 2 {
+		t.Errorf("expected at least 2 rotated .data files, found %d", dataFilesCount)
+	}
+}
